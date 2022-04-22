@@ -290,6 +290,15 @@ struct Mat svd(struct Mat A, double epsilon=1e-10):
     singularValues, us, vs = [np.array(x) for x in zip(*svdSoFar)]
     return singularValues, us.T, vs 
 
+//3*3 matrices multiplication
+  double matrixmul( double* array1, double* array2 ) 
+    {
+      double matrix1[3][3]={{*(array1), *(array1+1), *(array1+2)}, {*(array1+3), *(array1+4), *(array1+5)}, {*(array1+6), *(array1+7), *(array1+8)}}
+      double matrix2[3][3]={{*(array2), *(array2+1), *(array2+2)}, {*(array2+3), *(array2+4), *(array2+5)}, {*(array2+6), *(array2+7), *(array2+8)}}
+      double result[3][3]={{matrix2[0][0]*matrix1[0][0]+matrix2[1][0]*matrix1[0][1]+matrix2[2][0]*matrix1[0][2], matrix2[0][1]*matrix1[0][0]+matrix2[1][1]*matrix1[0][1]+matrix2[2][1]*matrix1[0][2], matrix2[0][2]*matrix1[0][0]+matrix2[1][2]*matrix1[0][1]+matrix2[2][2]*matrix1[0][2]},{matrix2[0][0]*matrix1[1][0]+matrix2[1][0]*matrix1[1][1]+matrix2[2][0]*matrix1[1][2], matrix2[0][1]*matrix1[1][0]+matrix2[1][1]*matrix1[1][1]+matrix2[2][1]*matrix1[1][2], matrix2[0][2]*matrix1[1][0]+matrix2[1][2]*matrix1[1][1]+matrix2[2][2]*matrix1[1][2]},{matrix2[0][0]*matrix1[2][0]+matrix2[1][0]*matrix1[2][1]+matrix2[2][0]*matrix1[2][2], matrix2[0][1]*matrix1[2][0]+matrix2[1][1]*matrix1[2][1]+matrix2[2][1]*matrix1[2][2], matrix2[0][2]*matrix1[2][0]+matrix2[1][2]*matrix1[2][1]+matrix2[2][2]*matrix1[2][2]}}
+      double* array3=&result[0][0]
+      return array3
+    }
 
 
   #pragma acc routine
@@ -317,7 +326,7 @@ struct Mat svd(struct Mat A, double epsilon=1e-10):
       double K_l4 = 0.053^4*dyn2N;      // Force constant longitudinal nn4
       double K_t4 = -0.030^4*dyn2N;   // Force constant transverse nn4
       
-      // The r_j of all neighbours
+      // The r_j of all neighbours (since r_j is not used until we calculate dispersion, we combine all the r_j together.)
       
       double r_j[27][3] = { {a/2,a/2,0}, {a/2,0,a/2}, {0,a/2,a/2}, {a/2,-a/2,0}, {a/2,0,-a/2}, {0,a/2,-a/2}, {a, 0, 0}, {0, a, 0}, {0, 0, a}, {a,a/2,a/2},{a, -a/2,-a/2},{a,-a/2,a/2},{a,a/2,-a/2},{a/2,a,a/2},{a/2,a-a/2},{a/2, -a, a/2},{a/2,-a,-a/2},{a/2, a/2, a},{a/2, a/2, -a},{a/2, -a/2, a},{a/2, -a/2, -a}, {a,a,0},{a,0,a},{0,a,a},{a,-a,0},{a,0,-a},{0,a,-a}};
       
@@ -325,29 +334,96 @@ struct Mat svd(struct Mat A, double epsilon=1e-10):
       
       
       double Phi_nn1x[3][3]={{K_l1, 0, 0}, {0, K_t1, 0}, {0, 0, K_t1}};
+      double* arrayPhi_nn1x=&Phi_nn1x[0][0]
       double Phi_nn1y[3][3]={{K_t1, 0, 0}, {0, K_l1, 0}, {0, 0, K_t1}};
       double si = sin(pi/4);
       double co = cos(pi/4);
+      double siinv = sin(-pi/4);
+      double coinv = cos(-pi/4);
       
+      //Rot^(-1) has been replaced by rotation in the negative angle. Still need to fix matrix multiplication
+
       double Rot1[3][3] = {{co, -si, 0}, {si, co, 0}, {0, 0, 1}};
-      double Phi_1 = Rot1*Phi_nn1x*Rot1^(-1)
+      double Rot1inv[3][3] = {{coinv, -siinv, 0}, {siinv, coinv, 0}, {0, 0, 1}};
+      double* array1=&Rot1[0][0]
+      double* array2=&Rot1inv[0][0]
+      double* array3=matrixmul(array1, arrayPhi_nn1x)
+      double Phi_1 =matrixmul(array3, array2)
+
       double Rot2[3][3] = {{co, 0, -si}, {0, 1, 0}, {si, 0, co}};
-      double Phi_2 = Rot2*Phi_nn1x*Rot2^(-1);
+      double Rot2inv[3][3] = {{coinv, 0, -siinv}, {0, 1, 0}, {siinv, 0, coinv}};
+      double Phi_2 = Rot2*Phi_nn1x*Rot2inv;
       double Rot3[3][3] = {{1, 0, 0}, {0, co, -si}, {0, si, co}};
-      double Phi_3 = Rot3*Phi_nn1y*Rot3^(-1);
+      double Rot3inv[3][3] = {{1, 0, 0}, {0, coinv, -siinv}, {0, siinv, coinv}};
+      double Phi_3 = Rot3*Phi_nn1y*Rot3inv;
       double Rot4[3][3] = {{co, si, 0} {-si, co, 0}, {0, 0, 1}};
-      double Phi_4 = Rot4*Phi_nn1x*Rot4^(-1);
+      double Rot4inv[3][3] = {{coinv, siinv, 0} {-siinv, coinv, 0}, {0, 0, 1}};
+      double Phi_4 = Rot4*Phi_nn1x*Rot4inv;
       double Rot5[3][3] = {{co, 0, si}, {0, 1, 0}, {-si, 0, co};
-      double Phi_5 = Rot5*Phi_nn1x*Rot5^(-1);
+      double Rot5inv[3][3] = {{coinv, 0, siinv}, {0, 1, 0}, {-siinv, 0, coinv};
+      double Phi_5 = Rot5*Phi_nn1x*Rot5inv;
       double Rot6[3][3] = {{1, 0, 0}, {0, co, si}, {0, -si, co}};
-      double Phi_6 = Rot6*Phi_nn1y*Rot6^(-1);
+      double Rot6inv[3][3] = {{1, 0, 0}, {0, coinv, siinv}, {0, -siinv, coinv}};
+      double Phi_6 = Rot6*Phi_nn1y*Rot6inv;
       
       // 2nd Neighbour
       
+      double Phi_nn2x[3][3]={{K_l2, 0, 0}, {0, K_t2, 0}, {0, 0, K_t2}};
+      double Phi_nn2y[3][3]={{K_t2, 0, 0}, {0, K_l2, 0}, {0, 0, K_t2}};
+      double Phi_nn2z[3][3]={{K_t2, 0, 0}, {0, K_t2, 0}, {0, 0, K_l2}};
       
+      double Phi_7[3][3] = Phi_nn2x;
+      double Phi_8[3][3] = Phi_nn2y;
+      double Phi_9[3][3] = Phi_nn2z;
+
+      // 3rd Neighbor
+
+      double Phi_nn3x[3][3]={{K_l3, 0, 0}, {0, K_t3, 0}, {0, 0, K_t3}};
+      double Phi_nn3y[3][3]={{K_t3, 0, 0}, {0, K_l3, 0}, {0, 0, K_t3}};
+      double c2 = 2/sqrt(6);
+      double c1 = 1/sqrt(6);
+      double c0 = 1/sqrt(2);
+      double c3 = 1/sqrt(3);
+      double Rot_10 = {{c2, c1, c1}, {0, c0, -c0}, {-c3, c3, c3}};
+      double Rot_10inv = {{c2, c1, c1}, {0, c0, -c0}, {-c3, c3, c3}};
+      double Phi_10 = Rot_10^(-1)*Phi_nn3x*Rot_10;
+      double Rot_11 = {{c2, -c1, -c1}, {0, c0, -c0}, {c3, c3, c3}};
+      double Rot_11inv = {{c2, -c1, -c1}, {0, c0, -c0}, {c3, c3, c3}};
+      double Phi_11 = Rot_11^(-1)*Phi_nn3x*Rot_11;
+      double Rot_12 = {{c2, -c1, c1}, {0, c0, c0}, {-c3, -c3, c3}};
+      double Rot_12inv = {{c2, -c1, c1}, {0, c0, c0}, {-c3, -c3, c3}};
+      double Phi_12 = Rot_12^(-1)*Phi_nn3x*Rot_12;
+      double Rot_13 = {{c2, c1, -c1}, {0, c0, c0}, {c3, -c3, c3}};
+      double Rot_13inv = {{c2, c1, -c1}, {0, c0, c0}, {c3, -c3, c3}};
+      double Phi_13 = Rot_13^(-1)*Phi_nn3x*Rot_13;
+      double Rot_14 = {{c1, c2, c1}, {-c0, 0, c0}, {c3, -c3, c3}};
+      double Rot_14inv = {{c1, c2, c1}, {-c0, 0, c0}, {c3, -c3, c3}};
+      double Phi_14 = Rot_14^(-1)*Phi_nn3x*Rot_14;
+      double Rot_15 = {{c1, c2, -c1}, {-c0, 0, -c0}, {-c3, c3, c3}};
+      double Rot_15inv = {{c1, c2, -c1}, {-c0, 0, -c0}, {-c3, c3, c3}};
+      double Phi_15 = Rot_15^(-1)*Phi_nn3x*Rot_15;
+      double Rot_16 = {{c1, -c2, c1}, {-c0, 0, c0}, {-c3, -c3, -c3}};
+      double Rot_16inv = {{c1, -c2, c1}, {-c0, 0, c0}, {-c3, -c3, -c3}};
+      double Phi_16 = Rot_16^(-1)*Phi_nn3x*Rot_16;
+      double Rot_17 = {{c1, -c2, -c1}, {-c0, 0, -c0}, {c3, c3, -c3}};
+      double Rot_17inv = {{c1, -c2, -c1}, {-c0, 0, -c0}, {c3, c3, -c3}};
+      double Phi_17 = Rot_17^(-1)*Phi_nn3x*Rot_17;
+      double Rot_18 = {{c1, c1, c2}, {c0, -c0, 0}, {c3, c3, -c3}};
+      double Rot_18inv = {{c1, c1, c2}, {c0, -c0, 0}, {c3, c3, -c3}};
+      double Phi_18 = Rot_18^(-1)*Phi_nn3x*Rot_18;
+      double Rot_19 = {{c1, c1, -c2}, {-c0, c0, 0}, {c3, c3, c3}};
+      double Rot_19inv = {{c1, c1, -c2}, {-c0, c0, 0}, {c3, c3, c3}};
+      double Phi_19 = Rot_19^(-1)*Phi_nn3x*Rot_19;
+      double Rot_20 = {{c1, -c1, c2}, {c0, c0, 0}, {-c3, c3, c3}};
+      double Rot_20inv = {{c1, -c1, c2}, {c0, c0, 0}, {-c3, c3, c3}};
+      double Phi_20 = Rot_20^(-1)*Phi_nn3x*Rot_20;
+      double Rot_21 = {{c1, -c1, -c2}, {-c0, -c0, 0}, {-c3, c3, -c3}};
+      double Rot_21inv = {{c1, -c1, -c2}, {-c0, -c0, 0}, {-c3, c3, -c3}};
+      double Phi_21 = Rot_21^(-1)*Phi_nn3x*Rot_21;
+
+      // 4th Neighbor
       
-      
-      // old stuf from the phonons
+      // old stuff from the phonons
       
       vf=parms[0];
       vi=parms[1];
