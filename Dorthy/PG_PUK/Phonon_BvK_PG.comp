@@ -1,0 +1,1571 @@
+/*******************************************************************************
+*
+*  McStas, neutron ray-tracing package
+*  Copyright(C) 2000 Risoe National Laboratory.
+*
+* %I
+* Written by: Kim Lefmann
+* Date: 04.02.04
+* July 2022
+* Origin: Risoe 
+* KU
+*
+* A sample for phonon scattering based on cross section expressions from Squires, Ch.3.
+* based upon component Phonon_simple
+* 
+* %D
+* Single-cylinder shape.
+* Absorption included.
+* No multiple scattering.
+* No incoherent scattering emitted.
+* No attenuation from coherent scattering. No Bragg scattering.
+* Specialized for PG
+*
+* Algorithm:
+* 0. Always perform the scattering if possible (otherwise ABSORB)
+* 1. Choose direction within a focusing solid angle
+* 2. Select a phonon mode at random
+* 3. Calculate the zeros of (E_i-E_f-hbar omega(kappa)) as a function of k_f
+* 4. Choose one value of k_f (always at least one is possible!)
+* 5. Perform the correct weight transformation
+*
+* %P
+* INPUT PARAMETERS:
+* radius: [m]         Outer radius of sample in (x,z) plane
+* yheight: [m]        Height of sample in y direction
+* sigma_abs: [barns]  Absorption cross section at 2200 m/s per atom
+* sigma_inc: [barns]  Incoherent scattering cross section per atom
+* a: [AA]             fcc Lattice constant
+* b: [fm]             Scattering length
+* M: [a.u.]           Atomic mass
+* c: [meV/AA^(-1)]    Velocity of sound
+* DW: [1]             Debye-Waller factor
+* T: [K]              Temperature
+* focus_r: [m]        Radius of sphere containing target.
+* focus_xw: [m]       horiz. dimension of a rectangular area
+* focus_yh: [m]       vert.  dimension of a rectangular area
+* focus_aw: [deg]     horiz. angular dimension of a rectangular area
+* focus_ah: [deg]     vert.  angular dimension of a rectangular area
+* target_x: [m]       position of target to focus at . Transverse coordinate
+* target_y: [m]       position of target to focus at. Vertical coordinate
+* target_z: [m]       position of target to focus at. Straight ahead.
+* target_index: [1]   relative index of component to focus at, e.g. next is +1 
+* gap: [meV]          Bandgap energy (unphysical)
+*
+* OUTPUT PARAMETERS:
+* V_rho: [AA^-3]      Atomic density
+* V_my_s: [m^-1]      Attenuation factor due to incoherent scattering
+* V_my_a_v: [m^-1]    Attenuation factor due to absorbtion
+*
+* %L
+* The test/example instrument <a href="../examples/Test_Phonon.instr">Test_Phonon.instr</a>.
+*
+* %E
+******************************************************************************/
+
+DEFINE COMPONENT Phonon_BvK_PG
+DEFINITION PARAMETERS ()
+SETTING PARAMETERS (radius,yheight,sigma_abs,sigma_inc,M,DW,T,int mode_input,
+target_x=0, target_y=0, target_z=0, int target_index=0,focus_r=0,focus_xw=0,focus_yh=0,focus_aw=0,focus_ah=0)
+OUTPUT PARAMETERS ()
+/* Neutron parameters: (x,y,z,vx,vy,vz,t,sx,sy,sz,p) */
+SHARE
+%{
+#ifndef PHONON_SIMPLE
+#define PHONON_SIMPLE $Revision$
+#define T2E (1/11.605)   /* Kelvin to meV */
+#define SMALL_NUMBER 1E-6
+#define STEPS 20    // division of intervals in search for solutions in omega_q 
+#define V_HIGH 4000   // Highest velocity to search` (TO BE CHANGED)
+    
+#pragma acc routine 
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+//#include "/usr/include/linux/types.h"// Change from Mads: On OS X this path is not valid
+#include"cnr.h"
+//#include <malloc.h>
+#include <stdlib.h> 
+    
+int mode;
+
+    double a=2.461;    //PG lattice constant in AA  paper gives 2.45
+    double c=6.708;    // PG lattice constant in AA  paper gives 6.70
+    double b = 6.646; // PG scattering legth in fm
+
+void Diagonalize(komplex **, long long, double *);
+
+
+double nbose(double omega, double T)  /* Other name ?? */
+  {
+    double nb;
+
+    nb= (omega>0) ? 1+1/(exp(omega/(T*T2E))-1) : 1/(exp(-omega/(T*T2E))-1);
+    return nb;
+  }
+#undef T2E
+/* Routine types from Numerical Recipies book */
+#define UNUSED (-1.11e30)
+#define MAXRIDD 60
+
+void fatalerror_cpu(char *s)
+  {
+    fprintf(stderr,"%s \n",s);
+    exit(1);
+  }
+ 
+#pragma acc routine 
+void fatalerror(char *s)
+  {
+  #ifndef OPENACC	
+    fatalerror_cpu(s);
+  #endif
+  }
+
+  #pragma acc routine
+/*  double omega_q_old(double* parms)
+    {
+      /* dispersion in units of meV  */
+/*      double vi, vf, vv_x, vv_y, vv_z, vi_x, vi_y, vi_z;
+      double q, qx, qy, qz, Jq, res_phonon, res_neutron;
+      double ah, a, c;
+      double gap;
+
+      vf=parms[0];
+      vi=parms[1];
+      vv_x=parms[2];
+      vv_y=parms[3];
+      vv_z=parms[4];
+      vi_x=parms[5];
+      vi_y=parms[6];
+      vi_z=parms[7];
+      a   =parms[8];
+      c   =parms[9];
+      gap =parms[10];
+      ah=a/2.0;
+
+      qx=V2K*(vi_x-vf*vv_x);
+      qy=V2K*(vi_y-vf*vv_y);
+      qz=V2K*(vi_z-vf*vv_z);
+       q=sqrt(qx*qx+qy*qy+qz*qz);
+      Jq=2*(cos(ah*(qx+qy))+cos(ah*(qx-qy))+cos(ah*(qx+qz))+cos(ah*(qx-qz))
+             +cos(ah*(qy+qz))+cos(ah*(qy-qz)) );
+      if (gap>0) {
+	res_phonon=sqrt(gap*gap+(12-Jq)*(c*c)/(a*a));
+      } else {
+        res_phonon=c/a*sqrt(12-Jq);
+      }
+      res_neutron = fabs(VS2E*(vi*vi-vf*vf));
+
+      return (res_phonon - res_neutron);
+    }
+*/
+
+void bubblesort (int size , double* inputarray , int* index)
+//this function modifies the inputarray by bubble sorting, and also modifies the index array as the
+//index after the sorting. The index array should be initialized as index[] = {0,1,2,3,4,5,6,7...}
+{
+    int tempindex = 0;
+    int i;
+    int j;
+    for (i = 0 ; i < size-1 ;  i++)
+    {
+        for (j = 0 ; j < size-i-1 ; j++)
+        {
+            if (inputarray[index[j]] > inputarray[index[j+1]])
+            {
+                tempindex = index[j];
+                index[j] = index[j+1];
+                index[j+1] = tempindex;
+            }
+        }
+    }
+    return;
+}
+
+//3*3 matrices multiplication
+void matrixmultiplication( double matrix1[3][3], double matrix2[3][3], double result[3][3])
+    {
+        // multiplies matrix1 by matrix2 and places the result in result
+//      double matrix1[3][3]={{*(array1), *(array1+1), *(array1+2)}, {*(array1+3), *(array1+4), *(array1+5)}, {*(array1+6), *(array1+7), *(array1+8)}};
+//      double matrix2[3][3]={{*(array2), *(array2+1), *(array2+2)}, {*(array2+3), *(array2+4), *(array2+5)}, {*(array2+6), *(array2+7), *(array2+8)}};
+
+      result[0][0]=matrix2[0][0]*matrix1[0][0]+matrix2[1][0]*matrix1[0][1]+matrix2[2][0]*matrix1[0][2];
+      result[0][1]=matrix2[0][1]*matrix1[0][0]+matrix2[1][1]*matrix1[0][1]+matrix2[2][1]*matrix1[0][2];
+      result[0][2]=matrix2[0][2]*matrix1[0][0]+matrix2[1][2]*matrix1[0][1]+matrix2[2][2]*matrix1[0][2];
+      result[1][0]=matrix2[0][0]*matrix1[1][0]+matrix2[1][0]*matrix1[1][1]+matrix2[2][0]*matrix1[1][2];
+      result[1][1]=matrix2[0][1]*matrix1[1][0]+matrix2[1][1]*matrix1[1][1]+matrix2[2][1]*matrix1[1][2];
+      result[1][2]=matrix2[0][2]*matrix1[1][0]+matrix2[1][2]*matrix1[1][1]+matrix2[2][2]*matrix1[1][2];
+      result[2][0]=matrix2[0][0]*matrix1[2][0]+matrix2[1][0]*matrix1[2][1]+matrix2[2][0]*matrix1[2][2];
+      result[2][1]=matrix2[0][1]*matrix1[2][0]+matrix2[1][1]*matrix1[2][1]+matrix2[2][1]*matrix1[2][2];
+      result[2][2]=matrix2[0][2]*matrix1[2][0]+matrix2[1][2]*matrix1[2][1]+matrix2[2][2]*matrix1[2][2];
+
+      return;
+    }
+    
+void matrix3multiplication(double matrix1[3][3], double matrix2[3][3], double matrix3[3][3], double result[3][3])
+    {
+        // Performs the multiplication (matrix1*matrix2)*matrix3 and placed the result in result
+//#define TEST_MULTIPLY
+        double temp[3][3];
+        matrixmultiplication(matrix1,matrix2,temp);
+        matrixmultiplication(temp,matrix3,result);
+#ifdef TEST_MULTIPLY
+        printf("Matrix3multiply called with \n");
+        printf("matrix1 = (");
+        for (int i=0; i<3; i++)
+        {
+            printf("( %g %g %g), ",matrix1[i][0], matrix1[i][1], matrix1[i][2]);
+        }
+        printf(")\n Matrix2 = (");
+        for (int i=0; i<3; i++)
+        {
+            printf("( %g %g %g), ",matrix2[i][0], matrix2[i][1], matrix2[i][2]);
+        }
+        printf(")\n Matrix3 = (");
+                for (int i=0; i<3; i++)
+        {
+            printf("( %g %g %g), ",matrix3[i][0], matrix3[i][1], matrix3[i][2]);
+        }
+        printf(")\n Temp = (");
+                for (int i=0; i<3; i++)
+        {
+            printf("( %g %g %g), ",temp[i][0], temp[i][1], temp[i][2]);
+        }
+        printf(")\n Result = (");
+                 for (int i=0; i<3; i++)
+        {
+            printf("( %g %g %g), ",result[i][0], result[i][1], result[i][2]);
+        }
+        printf(")\n");
+#endif // TEST_MULTIPLY
+
+        return;
+    }
+    
+
+komplex complexexp (double* q, double* rj)
+{
+    double qrj = *(q)**(rj)+*(q+1)**(rj+1)+*(q+2)**(rj+2);
+    return cos(qrj)+I*sin(qrj);
+}
+
+double omega_q(komplex* parms) {
+    
+    // _________________ INITIALIZE VARIABLES SHOULD BE DONE ONLY ONCE ___________________________
+    double THz2meV = 4.13566;
+    double Da2kg = 1.6605e-27; //Dalton to kg converter
+    double M = 12.011 * Da2kg; //atomic mass of C
+    double dyn2N = 1e-3; //Convert dyn/cm to N/m
+ 
+    double K_l1 =  3.62e+5 * dyn2N;     // Force constant longitudinal nn1 - in (a,b) plane
+    double K_t1 =  1.99e+5 * dyn2N;     // Force constant transverse nn1 - in (a,b) plane
+    double K_l2 =  1.33e+5 * dyn2N;     // Force constant longitudinal nn2 - in (a,b) plane
+    double K_t2 = -0.520e+5 * dyn2N;    // Force constant transverse nn2 - in (a,b) plane
+    double K_l3 = -0.037e+5 * dyn2N;    // Force constant longitudinal nn3 - in (a,b) plane
+    double K_t3 =  0.288e+5 * dyn2N;    // Force constant transverse nn3 - in (a,b) plane
+
+    double K_l4 =  0.058e+5 * dyn2N;    // Force constant longitudinal nn4 - along c
+    double K_t4 =  0.0077e+5 * dyn2N;   // Force constant transverse nn4 - along c
+    
+    //Lattice basis
+    
+    // PG is hexagonal close packed with 4 atoms per cell
+    // Coordinates from the paper Fig. 7: Atoms A, B, C, D
+    double s3 = sqrt(3);
+    double Delta[4][3] = {{0 , 0 , 0} , {a/(2*s3) , a/2 , 0} , {0 , 0 , c/2} , { -a/(2*s3) , a/2 , c/2}};
+
+    // Lattice vectors from paper fig. 7
+    double avec[3] = {a*s3/2 , a*0.5 , a*0};
+    double bvec[3] = {a*(-s3/2) , a*0.5 , a*0};
+    double cvec[3] = {c*0 , c*0 , c*1};
+
+    // reciprocal lattice vectors
+    double astar = 4*PI/(sqrt(3)*a);  // length of reciprocal lattice vector a*
+    double cstar = 2*PI/c;  // length of reciprocal lattice vector c*
+
+    // Rotation matrices
+    double Rot120[3][3] = {{-0.5 , s3/2 , 0} , {-s3/2 , -0.5 , 0} , {0 , 0 , 1}};
+    double Rot60[3][3] = {{0.5 , s3/2 , 0} , {-s3/2 , 0.5 , 0} , {0 , 0 , 1}};
+    double Rot120rev[3][3] = {{-0.5 , -s3/2 , 0} , {s3/2 , -0.5 , 0} , {0 , 0 , 1}}; //rotate -120
+    double Rot60rev[3][3] = {{0.5 , -s3/2 , 0} , {s3/2 , 0.5 , 0} , {0 , 0 , 1}}; //rotate -60
+    double Rot180[3][3] = {{-1, 0, 0}, {0, -1, 0}, {0, 0, 1}}; // rotate 180 or -180
+    
+    //1st neighbour
+    
+    double r_j1[3][3] = {{a*(-1/s3) , a*0 , a*0} , {a*0.5/s3 , a*(-0.5) , a*0} , {a*0.5/s3 , a*0.5 , a*0}}; // This holds from atoms A and D
+    double r_j2[3][3] = {{-a*(-1/s3) , -a*0 , -a*0} , {-a*0.5/s3 , -a*(-0.5) , -a*0} , {-a*0.5/s3 , -a*0.5 , -a*0}}; // This holds from atoms B and C
+
+    double Phi_nn1[3][3] = {{K_l1 , 0 , 0} , {0 , K_t1 , 0} , {0 , 0 , K_t1}};
+
+    double Phi1[3][3] = {{K_l1 , 0 , 0} , {0 , K_t1 , 0} , {0 , 0 , K_t1}}; //Phi1 = Phi_nn1
+
+    double Phi2[3][3];
+    matrix3multiplication(Rot120,Phi_nn1,Rot120rev,Phi2); //Rot2*Phi_nn1*Rot2^(-1)
+
+    double Phi3[3][3];
+    matrix3multiplication(Rot120rev,Phi_nn1,Rot120,Phi3);
+    
+     
+    //2nd neighbour
+    double r_add[6][3] = {{0 , a , 0} , {-a*s3/2 , a/2 , 0} , {-a*s3/2 , -a/2 , 0} , {0 , -a , 0} , {a*s3/2 , -a/2 , 0} , {a*s3/2 , a/2 , 0}};
+    double r_j11[9][3] = {{a*(-1/s3) , a*0 , a*0} , {a*0.5/s3 , a*(-0.5) , a*0} , {a*0.5/s3 , a*0.5 , a*0} , {0 , a , 0} , {-a*s3/2 , a/2 , 0} , {-a*s3/2 , -a/2 , 0} , {0 , -a , 0} , {a*s3/2 , -a/2 , 0} , {a*s3/2 , a/2 , 0}};//r_j1 + r_add
+    double r_j21[9][3] = {{-a*(-1/s3) , -a*0 , -a*0} , {-a*0.5/s3 , -a*(-0.5) , -a*0} , {-a*0.5/s3 , -a*0.5 , -a*0} , {0 , a , 0} , {-a*s3/2 , a/2 , 0} , {-a*s3/2 , -a/2 , 0} , {0 , -a , 0} , {a*s3/2 , -a/2 , 0} , {a*s3/2 , a/2 , 0}};//r_j2 + r_add
+    double Phi_nn2[3][3] = {{K_t2 , 0 , 0} , {0 , K_l2 , 0} , {0 , 0 , K_t2}};
+    
+    double Phi4[3][3] = {{K_t2 , 0 , 0} , {0 , K_l2 , 0} , {0 , 0 , K_t2}};
+    double Rot5[3][3] = {{0.5 , s3/2 , 0} , {-s3/2 , 0.5 , 0} , {0 , 0 , 1}}; //rotate 60
+    double Rot5rev[3][3] = {{0.5 , -s3/2 , 0} , {s3/2 , 0.5 , 0} , {0 , 0 , 1}}; //rotate -60
+    double Phi5[3][3];
+    matrix3multiplication(Rot5,Phi_nn2,Rot5rev,Phi5);
+    
+    double Phi6[3][3];
+    matrix3multiplication(Rot120,Phi_nn2,Rot120rev,Phi6); //Rot6*Phi_nn2*Rot6^(-1);
+        
+    double Phi7[3][3];
+    matrix3multiplication(Rot180,Phi_nn2,Rot180,Phi7); //Rot7*Phi_nn2*Rot7^(-1);
+
+    double Phi8[3][3];
+    matrix3multiplication(Rot120rev,Phi_nn2,Rot120,Phi8); //Rot8*Phi_nn2*Rot8^(-1);
+    
+    double Phi9[3][3];
+    matrix3multiplication(Rot60rev,Phi_nn2,Rot60,Phi9);  //Rot9*Phi_nn2*Rot9^(-1);
+
+    //3rd neighbour
+    double r_add2[3][3] = {{2*a/s3 , 0 , 0} , {-a/s3 , a , 0} , {-a/s3 , -a , 0}};
+    double r_j12[12][3] = {{a*(-1/s3) , a*0 , a*0} , {a*0.5/s3 , a*(-0.5) , a*0} , {a*0.5/s3 , a*0.5 , a*0} , {0 , a , 0} , {-a*s3/2 , a/2 , 0} , {-a*s3/2 , -a/2 , 0} , {0 , -a , 0} , {a*s3/2 , -a/2 , 0} , {a*s3/2 , a/2 , 0} , {2*a/s3 , 0 , 0} , {-a/s3 , a , 0} , {-a/s3 , -a , 0}};//r_j11 + r_add2
+    double r_j22[12][3] = {{-a*(-1/s3) , -a*0 , -a*0} , {-a*0.5/s3 , -a*(-0.5) , -a*0} , {-a*0.5/s3 , -a*0.5 , -a*0} , {0 , a , 0} , {-a*s3/2 , a/2 , 0} , {-a*s3/2 , -a/2 , 0} , {0 , -a , 0} , {a*s3/2 , -a/2 , 0} , {a*s3/2 , a/2 , 0} , {-2*a/s3 , 0 , 0} , {a/s3 , -a , 0} , {a/s3 , a , 0}};//r_j21 - r_add2
+
+     
+    double Phi_nn3[3][3] = {{K_l3 , 0 , 0} , {0 , K_t3 , 0} , {0 , 0 , K_t3}};
+
+    // c2 = 2/sqrt(6);
+    // c1 = 1/sqrt(6);
+    // c0 = 1/sqrt(2);
+    // c3 = 1/sqrt(3);
+
+    double Phi10[3][3] = {{K_l3 , 0 , 0} , {0 , K_t3 , 0} , {0 , 0 , K_t3}}; //Phi_nn3;
+
+    double Phi11[3][3];
+    matrix3multiplication(Rot120,Phi_nn3,Rot120rev,Phi11);  //Rot11*Phi_nn3*Rot11^(-1);
+    
+    double Phi12[3][3];
+    matrix3multiplication(Rot120rev,Phi_nn3,Rot120,Phi12); //Rot12*Phi_nn3*Rot12^(-1);
+    
+    //4th neighbour
+    double r_add3[2][3] = {{0 , 0 , c/2*1} , {0 , 0 , c/2*(-1)}};
+    double r_j13[14][3] = {{a*(-1/s3) , a*0 , a*0} , {a*0.5/s3 , a*(-0.5) , a*0} , {a*0.5/s3 , a*0.5 , a*0} , {0 , a , 0} , {-a*s3/2 , a/2 , 0} , {-a*s3/2 , -a/2 , 0} , {0 , -a , 0} , {a*s3/2 , -a/2 , 0} , {a*s3/2 , a/2 , 0} , {2*a/s3 , 0 , 0} , {-a/s3 , a , 0} , {-a/s3 , -a , 0} , {0 , 0 , c/2*1} , {0 , 0 , c/2*(-1)}};//r_j12 + r_add3 Sublattice B and D do not have this coupling
+
+    double Phi_nn4[3][3] = {{K_t4 , 0 , 0} , {0 , K_t4 , 0} , {0 , 0 , K_l4}};
+     
+    double Phi13[3][3] = {{K_t4 , 0 , 0} , {0 , K_t4 , 0} , {0 , 0 , K_l4}}; //Phi_nn4;
+    double Phi14[3][3] = {{K_t4 , 0 , 0} , {0 , K_t4 , 0} , {0 , 0 , K_l4}}; //Phi_nn4;
+    
+    
+    // _______________ END INITIALIZE ___________________________
+
+    
+    // _______________ DETERMINE Q ____________________________
+    
+      double vi, vf, vv_x, vv_y, vv_z, vi_x, vi_y, vi_z;
+      double q, qx, qy, qz, Jq, hw_phonon, hw_neutron;
+
+      vf=parms[0];
+      vi=parms[1];
+      vv_x=parms[2];
+      vv_y=parms[3];
+      vv_z=parms[4];
+      vi_x=parms[5];
+      vi_y=parms[6];
+      vi_z=parms[7];
+ 
+      qx=V2K*(vi_x-vf*vv_x);
+      qy=V2K*(vi_y-vf*vv_y);
+      qz=V2K*(vi_z-vf*vv_z);
+    
+    double qvec[3]={qx,qy,qz};
+    
+    
+    // ________________ END DETERMINE Q ________________-
+    
+    // #define TEST_MATRICES
+    
+    komplex Phi_diag[3][3];
+    int i;
+    int j;
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            Phi_diag[i][j] = Phi1[i][j]+Phi2[i][j]+Phi3[i][j]+Phi4[i][j]*(1-(*complexexp)(&qvec[0], &r_j13[3][0]))+Phi5[i][j]*(1-(*complexexp)(&qvec[0], &r_j13[4][0]))+Phi6[i][j]*(1-(*complexexp)(&qvec[0], &r_j13[5][0]))+Phi7[i][j]*(1-(*complexexp)(&qvec[0], &r_j13[6][0]))+Phi8[i][j]*(1-(*complexexp)(&qvec[0], &r_j13[7][0]))+Phi9[i][j]*(1-(*complexexp)(&qvec[0], &r_j13[8][0]))+Phi10[i][j]+Phi11[i][j]+Phi12[i][j];
+        }
+    }
+    
+    komplex Phi_diag1[3][3];
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            Phi_diag1[i][j] = Phi13[i][j]+Phi14[i][j];
+        }
+    }
+    
+    komplex Phi_offdiag1[3][3];
+    komplex Phi_offdiag2[3][3];
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            Phi_offdiag1[i][j] =-Phi1[i][j]*((*complexexp)(&qvec[0], &r_j13[0][0]))-Phi2[i][j]*((*complexexp)(&qvec[0], &r_j13[1][0]))-Phi3[i][j]*((*complexexp)(&qvec[0], &r_j13[2][0]))-Phi10[i][j]*((*complexexp)(&qvec[0], &r_j13[9][0]))-Phi11[i][j]*((*complexexp)(&qvec[0], &r_j13[10][0]))-Phi12[i][j]*((*complexexp)(&qvec[0], &r_j13[11][0]));
+            Phi_offdiag2[i][j] = conj(Phi_offdiag1[i][j]);
+        }
+    }
+    
+    komplex Phi_6Dim[6][6];
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            Phi_6Dim[i][j] = Phi_diag[i][j]+Phi_diag1[i][j];
+            Phi_6Dim[i][j+3] = Phi_offdiag1[i][j];
+            Phi_6Dim[i+3][j] = Phi_offdiag2[i][j];
+            Phi_6Dim[i+3][j+3] = Phi_diag[i][j];
+        }
+    }
+    
+    komplex Phi_AC[3][3];
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            Phi_AC[i][j] = -Phi13[i][j]*((*complexexp)(&qvec[0], &r_j13[12][0]))-Phi14[i][j]*((*complexexp)(&qvec[0], &r_j13[13][0]));
+        }
+    }
+    
+    komplex Zero_3Dim[3][3] = {{0 , 0 , 0},{0 , 0 , 0},{0 , 0 , 0}};
+
+    komplex Phi_6Dim_offdiag[6][6];
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            Phi_6Dim_offdiag[i][j] = Phi_AC[i][j];
+            Phi_6Dim_offdiag[i][j+3] = Zero_3Dim[i][j];
+            Phi_6Dim_offdiag[i+3][j] = Zero_3Dim[i][j];
+            Phi_6Dim_offdiag[i+3][j+3] = Zero_3Dim[i][j];
+        }
+    }
+
+    komplex Phi_12Dim[12][12];
+    for (i = 0; i < 6; i++) {
+        for (j = 0; j < 6; j++) {
+            Phi_12Dim[i][j] = Phi_6Dim[i][j];
+            Phi_12Dim[i][j+6] = Phi_6Dim_offdiag[i][j];
+            Phi_12Dim[i+6][j] = conj(Phi_6Dim_offdiag[i][j]);
+            Phi_12Dim[i+6][j+6] = Phi_6Dim[i][j];
+        }
+    }
+    
+#ifdef TEST_MATRICES
+    printf("Phi_12Dim=\n");
+    for (i = 0; i < 12; i++) {
+        for (j = 0; j< 12; j++) {
+            if (j == 0) {
+                printf("{");
+            }
+            printf("%g+(%g)i  ", real(Phi_12Dim[i][j]) , imag((Phi_12Dim[i][j])));
+            if (j == 11) {
+                printf("}\n");
+            }
+        }
+    }
+    
+    printf("Phi_6Dim=\n");
+    for (i = 0; i < 6; i++) {
+        for (j = 0; j< 6; j++) {
+            if (j == 0) {
+                printf("{");
+            }
+            printf("%g+(%g)i  ", real(Phi_6Dim[i][j]) , imag((Phi_6Dim[i][j])));
+            if (j == 5) {
+                printf("}\n");
+            }
+        }
+    }
+
+    printf("Phi_diag=\n");
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j< 3; j++) {
+            if (j == 0) {
+                printf("{");
+            }
+            printf("%g+(%g)i  ", real(Phi_diag[i][j]) , imag((Phi_diag[i][j])));
+            if (j == 2) {
+                printf("}\n");
+            }
+        }
+    }
+    printf("Phi2={{%lf,%lf,%lf},{%lf,%lf,%lf},{%lf,%lf,%lf}}\n",Phi2[0][0],Phi2[0][1],Phi2[0][2],Phi2[1][0],Phi2[1][1],Phi2[1][2],Phi2[2][0],Phi2[2][1],Phi2[2][2]);
+    printf("Phi3={{%lf,%lf,%lf},{%lf,%lf,%lf},{%lf,%lf,%lf}\n}",Phi3[0][0],Phi3[0][1],Phi3[0][2],Phi3[1][0],Phi3[1][1],Phi3[1][2],Phi3[2][0],Phi3[2][1],Phi3[2][2]);
+    printf("Phi5={{%lf,%lf,%lf},{%lf,%lf,%lf},{%lf,%lf,%lf}\n}",Phi5[0][0],Phi5[0][1],Phi5[0][2],Phi5[1][0],Phi5[1][1],Phi5[1][2],Phi5[2][0],Phi5[2][1],Phi5[2][2]);
+    printf("Phi7={{%lf,%lf,%lf},{%lf,%lf,%lf},{%lf,%lf,%lf}\n}",Phi7[0][0],Phi7[0][1],Phi7[0][2],Phi7[1][0],Phi7[1][1],Phi7[1][2],Phi7[2][0],Phi7[2][1],Phi7[2][2]);
+    printf("Phi9={{%lf,%lf,%lf},{%lf,%lf,%lf},{%lf,%lf,%lf}\n}",Phi9[0][0],Phi9[0][1],Phi9[0][2],Phi9[1][0],Phi9[1][1],Phi9[1][2],Phi9[2][0],Phi9[2][1],Phi9[2][2]);
+    printf("Phi14={{%lf,%lf,%lf},{%lf,%lf,%lf},{%lf,%lf,%lf}\n}",Phi14[0][0],Phi14[0][1],Phi14[0][2],Phi14[1][0],Phi14[1][1],Phi14[1][2],Phi14[2][0],Phi14[2][1],Phi14[2][2]);
+
+#endif // TEST_MATRICES
+
+  double eigenvalue[12]; 
+  komplex eigenvector[12][12]; 
+  int index[12];
+  long long dim = 12;
+  komplex **Matrix;
+  
+  Matrix = kmatrix(1,dim,1,dim);
+  for (i=0; i<dim; i++)
+      for (j=0; j<dim; j++)
+          Matrix[i+1][j+1] = Phi_12Dim[i][j];
+  Diagonalize(Matrix, dim, eigenvalue);
+  for (i=0; i<dim; i++)
+      for (j=0; j<dim; j++)
+          eigenvector[i][j] = Matrix[i+1][j+1];
+//  for (i=0; i<dim; i++)
+//{
+//eigenvalue[i]*=THz2meV;
+//}
+
+#ifdef TEST_DIAGONALIZE_LV2
+  printf("Diagonalization done, eigenvalues are: \n (");
+  for (i=0; i<dim; i++)
+  {
+      printf(" %g, ",eigenvalue[i]);
+  }
+  printf(" )\n";
+#endif    
+  freecmatrix(Matrix,1,dim,1,dim);
+    
+ 
+    for (i = 0; i < dim ; i++) //initialize index
+    {
+        index[i] = i;
+    }
+//#define TEST_BUBBLE
+#ifdef TEST_BUBBLE
+    for (i=0; i<dim; i++) {
+        printf("index: %d eigenvalue: %g eigenvector: ( ",index[i],eigenvalue[i]);
+        for (j=0; j<dim; j++) 
+            printf("(%g + i %g) , ",real(eigenvector[i][j]),imag(eigenvector[i][j]));
+        printf(" ) \n");
+    }
+#endif //TEST_BUBBLE
+    bubblesort(dim,&eigenvalue[0],&index[0]);
+    //arrange eigenvector
+    komplex eigenvectorgood[dim][dim]; 
+    double eigenvaluegood[dim];
+
+    for (i = 0; i < dim ; i++)
+    {
+        for (j = 0; j < dim ; j++)
+        {
+            eigenvectorgood[i][j] = eigenvector[index[i]][j];
+        }
+        eigenvaluegood[i] = sqrt(real(eigenvalue[index[i]]))/sqrt(M)/(2*PI*1E12)*THz2meV; // convert to units of THz
+
+#ifdef TEST_BUBBLE
+        printf("i: %d, index[i]: %d, eigenvalue[i]: %g, eigenvalue[index[i]: %g \n",i,index[i],eigenvalue[i],eigenvalue[index[i]]);
+#endif //TEST_BUBBLE
+    }
+
+        
+    
+
+    // ___________________ RETURN RESULTS TO CALLING FUNCTION __________________
+    
+      hw_neutron = fabs(VS2E*(vi*vi-vf*vf)); // neutron energy transfer 
+      // fabs used to find both positive and negative solutions, controlled by findroots()  
+      
+      hw_phonon = eigenvaluegood[mode];  // phonon energy
+ 
+  
+      parms[8] = eigenvectorgood[mode][0];
+      parms[9] = eigenvectorgood[mode][1];
+      parms[10] = eigenvectorgood[mode][2];
+      parms[11] = eigenvectorgood[mode][3];
+      parms[12] = eigenvectorgood[mode][4];
+      parms[13] = eigenvectorgood[mode][5];
+      parms[14] = eigenvectorgood[mode][6];
+      parms[15] = eigenvectorgood[mode][7];
+      parms[16] = eigenvectorgood[mode][8];
+      parms[17] = eigenvectorgood[mode][9];
+      parms[18] = eigenvectorgood[mode][10];
+      parms[19] = eigenvectorgood[mode][11];
+      parms[20] = hw_phonon;
+// if (abs(hw_phonon - hw_neutron) < SMALL_NUMBER)
+//      printf("q = ( %g , %g , %g ), q_abs = ( %g %g %g),  hw_q = %g \n",qx/astar,qy/astar,qz/cstar,qx,qy,qz,hw_phonon);
+
+      return (hw_phonon - hw_neutron);
+
+
+}
+
+    // ------------------START OF THE DIAGONALIZATION CODE--------------------
+
+#define SIGN_CONTROLLED(a,b) ((b)<0 ? -fabs(a) : fabs(a))
+//#define TEST_DIAGONALIZE
+//#define TEST_DIAGONALIZE_LV2
+//#define FIND_EIGENSTATE
+
+void htred2(komplex**,long long,komplex*,komplex*);   
+long long htqli(double*,double*,long long,komplex**);
+void eigsrt(double*,komplex**,long long);
+
+
+void nrerror(const char *error_text){
+  printf("Numerical Recipes run-time error ...\n");
+  printf("%s\n",error_text);
+  printf("... now exiting to system.\n");
+  exit(1);
+}
+
+double *dvector(long long nl, long long nh){
+  double *dv;
+
+  dv=(double*) malloc((unsigned) (nh-nl+1)*sizeof(double));
+  if(dv==NULL) {
+    fprintf(stderr,"nl: %lld  nh: %lld\n",nl,nh);
+    fprintf(stderr,"Allocation error in dvector()\n");
+    exit(-1);
+  }
+  dv-=nl; //move pointer, so that i.e. dv[nl] accessing the first element of dvec.
+  return(dv);
+}
+
+void freedvector(double *dv, long long nl, long long nh){
+  free(dv+nl); //pointers must be freed at the start of their actual memory location
+}
+
+double **dmatrix(long long ml, long long mh, long long nl, long long nh)
+{
+  double **dm;
+  long long i;
+  
+  dm=(double**) malloc((unsigned) (mh-ml+1)*sizeof(double*));
+  if(dm==NULL) nrerror("Allocation error 1 in dmatrix()\n");
+  dm -= ml;
+
+  for(i=ml;i<=mh;i++){
+    dm[i]=(double*) malloc((unsigned) (nh-nl+1)*sizeof(double));
+    if(dm[i]==NULL) nrerror("Allocation error 2 in dmatrix()");
+    dm[i] -= nl;
+  }
+  
+  return(dm);
+}
+
+void freedmatrix(double **dm, long long ml, long long mh, long long nl, long long nh){
+  long long i;
+
+  for(i=ml;i<=mh;i++)
+    free(dm[i]+nl);
+
+  free(dm+ml);
+}
+
+komplex *cvector(long long nl, long long nh){ //(kvector = cvector )
+  komplex *cv;
+
+  cv=(komplex*) malloc((unsigned) (nh-nl+1)*sizeof(komplex));
+  if(cv==NULL) nrerror("Allocation error in cvector()\n");
+  cv-=nl;
+  return(cv);
+}
+
+// Change from Mads: On OS X this path is not valid
+void freecvector(komplex *cv, long long nl, long long nh){
+  free(cv+nl);
+}
+
+komplex **cmatrix(long long ml, long long mh, long long nl, long long nh) // cmatrix = kmatrix
+{
+  komplex **cm;
+  long long i;
+  // Change from Mads: On OS X this path is not valid
+  cm=(komplex**) malloc((unsigned) (mh-ml+1)*sizeof(komplex*));
+  if(cm==NULL) nrerror("Allocation error 1 in cmatrix()\n");
+  cm -= ml;
+
+  for(i=ml;i<=mh;i++){
+    cm[i]=(komplex*) malloc((unsigned) (nh-nl+1)*sizeof(komplex));
+    if(cm[i]==NULL) nrerror("Allocation error 2 in cmatrix()");
+    cm[i] -= nl;
+  }
+  
+  return(cm);
+}
+
+void freecmatrix(komplex **cm, long long ml, long long mh, long long nl, long long nh){
+  long long i;
+
+  for(i=ml;i<=mh;i++)
+    free(cm[i]+nl);
+
+  free(cm+ml);
+}
+
+void Diagonalize(komplex **H, long long num, double *ddin)
+{
+  long long i,j,jj;
+  double *ee, *dd;
+  komplex *d,*e;
+
+#ifdef TEST_DIAGONALIZE
+  printf("Diagonalization called with matrix of dimension %lld \n",num);
+  for(i=1;i<=num;i++) {
+    for(j=1;j<=num;j++) 
+    {
+      printf("( %g", real(H[i][j]));
+      printf(" + i %g )",imag(H[i][j]));
+    }
+    printf("\n");
+  } 
+#endif  /* TEST_DIAGONALIZE */
+
+        /* Allocate */
+        e = kvector(1, num);
+        d = kvector(1, num);
+        ee = dvector(1, num+1); //meaning ee: 1 : num+1 
+        dd = dvector(0, num+1); //copy container for ddin=energies
+
+#ifdef TEST_DIAGONALIZE 
+        printf("After allocation\n");
+        for (int i = 1; i <= num; i++)
+        {
+                printf("dd[i] = %g", dd[i]);
+                printf(",ee[i+1] = %g", ee[i]);
+                printf("\n");
+        }
+#endif
+
+        /* Move pointers to change indexation */
+        //H--;
+        //for (i = 1; i <= num; i++) H[i]++;
+        for (jj = 0; jj <= num;jj++) {
+                dd[jj] = ddin[jj];
+        }
+
+        dd=dd-1;
+
+      /* TriDiagonalize matrix */
+
+        htred2(H, num, d, e);
+
+        #ifdef TEST_DIAGONALIZE 
+                printf("After htred2\n");
+                for (int i = 0; i <= num+1; i++)
+                {
+                        printf("i = %d",i);
+                        printf(", d[i] = %g", real(d[i]));
+                        printf(" + i %g", imag(d[i]));
+                        printf(",e [i] = %g", real(e[i]));
+                        printf(" + i %g", imag(e[i]));
+                        printf("\n");
+                }
+        #endif
+
+      ee[1] = 0;
+        for (i = 1; i <= num; i++)
+        {
+                ee[i + 1] = abs(e[i]);
+                dd[i] = real(d[i]);
+
+                #ifdef TEST_DIAGONALIZE
+                                printf("i = %lld",i);
+                                printf(", dd[i] = %g", dd[i]);
+                                printf(",ee[i] = %g", ee[i]);
+                                printf("\n");
+                #endif  /* TEST_DIAGONALIZE */
+        }
+        #ifdef TEST_DIAGONALIZE
+                printf("\n\n Tridiag hamil= \n ");
+                for (i = 1; i <= num; i++) {
+                        for (j = 1; j <= num; j++)
+                        {
+                                if (j == i){
+                                        printf("( %g )", dd[i]);
+                                }
+                                else if (j - 1 == i) {
+                                        printf("( %g )", ee[i + 1]);
+                                }
+                                else if (j == i - 1) {
+                                        printf("( %g )", ee[j + 1]);
+                                }
+                                else{
+                                        printf("( %g )", real(zero));
+                                }
+                        }
+                        printf("\n");
+                }
+
+                for (i = 1; i <= num; i++) {
+                        for (j = 1; j <= num; j++)
+                        {
+                                printf("( %g", real(H[i][j]));
+                                printf(" + i %g )", imag(H[i][j]));
+                        }
+                        printf("\n");
+                }
+        #endif  /* TEST_DIAGONALIZE */
+
+//Diagonalize:
+
+        htqli(dd, ee, num, H);
+
+        #ifdef TEST_DIAGONALIZE 
+                printf("After htqli:\n");
+                for (int i = 1; i <= num+1; i++)
+                {
+                        printf("i = %d",i);
+                        printf(", dd[i] = %g", dd[i]);
+                        printf(",ee[i] = %g \n", ee[i]);
+                }
+        #endif
+
+        #ifdef TEST_DIAGONALIZE_LV2
+                printf("Diagonalization done, resulting eigenvectors\n");
+                for (i = 1; i <= num; i++) {
+                        for (j = 1; j <= num; j++)
+                        {
+                                  printf(" ( %g", real(H[i][j]));
+                                  printf(" + i %g )", imag(H[i][j]));
+                        }
+                        printf("\n");
+                }
+               printf("Diagonalization done, resulting eigenvalues\n");
+                for (i = 1; i <= num; i++) {
+                        printf(" ( %g", real(dd[i]));
+                        printf(" + i %g )", imag(dd[i]));
+                }
+                printf("\n");
+        #endif  /* TEST_DIAGONALIZE_LV2 */
+
+        /* Sort eigenvalules */
+        /*  eigsrt(dd,H,num); */
+
+        for (jj = 0; jj <= num; jj++)
+                ddin[jj] = dd[jj+1];
+        //for (i = 1; i <= num; i++) H[i]--;
+        //H++;
+
+
+        /* Reset pointers */
+        dd=dd+1;
+
+        #ifdef TEST_DIAGONALIZE
+                printf("\nBefore deallocation\n");
+        #endif
+
+        freekvector(e,1, num);
+        freekvector(d,1, num);
+        freedvector(ee,1, num+1);
+        freedvector(dd,0, num+1);
+
+  return;
+}  
+			      
+
+void htred2(komplex **a,long long num,komplex *d,komplex *e)	{    
+       /* Implemented by Erik - borrowed from OpenMP implementation of the Householder reduction for complex
+        matrices by Andreas Honecker and Josef Schüle.
+        Code is like old Hedegaard code inspired by numerical recipes c code Householders algorithm
+        for real symmetric matrices
+        Original code from Andreas Honecker and Josef Schüler can be found at:
+        http://www.theorie.physik.uni-goettingen.de/~honecker/householder/
+        */
+        int l, k, j, i, ii, jj;
+        double scale, hh, h;
+        komplex g, f;
+        komplex sigma;
+        komplex c1, c2;
+        komplex *cptr1, *cptr2, *cptr3;
+        long long dim = num;
+        komplex *p;
+
+        // e[dim - 1]   //off - diagonal
+        // d diagonal elements
+        p = kvector(1, num);
+
+#ifdef TEST_DIAGONALIZE
+  printf("Inside diagonalization htred2. Dim = %lld, Matrix = \n",num);
+  for(ii=1;ii<=num;ii++) {
+    for(jj=1;jj<=num;jj++) 
+    {
+      printf(" ( %g ",real(a[ii][jj]));
+      printf(" + i %g ",imag(a[ii][jj]));
+      printf(" ) ");
+    }
+    printf("\n");
+  }
+  printf("\n");
+#endif
+
+for (i = dim; i >= 2; i--)  /* start from the lower right corner of a */
+{
+        l = i - 1;
+        h = scale = 0;
+        if (l > 1) {
+                for (k = 1; k <= l; k++) {                    /* sum row of a */
+                        scale += abs(a[i][k]);
+                }
+#ifdef TEST_DIAGONALIZE
+    printf("scale = %g \n",scale);
+#endif
+                if (scale == 0)                       /* skip transformation if this is zero */
+                        e[l] = conj(a[i][l]);                   /* copy complex conjugate of matrix element above diagonal */
+                else {
+                        for (k = 1; k <= l; k++) {
+                                a[i][k] /= scale;                     /* rescale entries of a */
+                                h += abs(a[i][k] * (conj(a[i][k])));         /* and accumulate norm (squared) of "u" in h (to form sigma) */
+                        }
+                        f = a[i][l];                          /* store entry m[i][i-1] in f */
+                        /* we have to choose sigma = a[i][i-1]/a[i][i-1]^* if |a[i]|^2 not zero */
+                        if (abs(f*(conj(f))))
+                        {
+                                sigma = f / (conj(f));
+                        }
+                        else
+                                sigma = 1;                            /* phase doesn't matter for |a[i][i-1]|^2 = 0 */
+                        sigma *= h;
+
+                        /* g = +/- sqrt(sigma), where the sign is chosen such that |a[i][i-1] - g| is as large as possible */
+                        g = skrt(sigma);
+#ifdef TEST_DIAGONALIZE
+      printf("h: %g , sigma: (%g + i %g) , g: (%g + i %g) \n",h,real(sigma),imag(sigma),real(g),imag(g));                  
+#endif
+                        c1 = f + g;
+                        c2 = f - g;
+                        if (abs(c1*(conj(c1)))> abs(c2*(conj(c2))))
+                                g = -g;
+                        c1 = scale*g;   /* store scale*g below diagonal */
+                        e[l] = conj(c1);                              /* and scale*g^* above */
+                        /* h = |a[i]|^2 - Re(g^* f) */
+                        h -= (real(g)*real(f) + imag(g)*imag(f));
+                        /* substitute a[i][i-1] by  a[i][i-1] - g = f - g (=>  a[i] = u^t) */
+                        a[i][l] = f - g;
+                        for (j = 1; j <= l; j++) {
+#ifdef FIND_EIGENSTATE
+                                a[j][i] = a[i][j] / h;
+
+#endif /* FIND_EIGENSTATE */
+                               p[j] = zero;                          /* Initialize p=0 */
+                        }
+                        for (k = 1; k <= l; k++) {                   /* First part of A u -> p */
+                                for (j = 1; j <= k - 1; j++){
+                                        /* The elements above the diagonal can be related to those below it using hermiticity */
+                                        p[j] += (conj(a[k][j])) *(conj(a[i][k]));  /* p += a[k][j]^* * a[i][k]^* DET kan godt se
+                                                                                                          som om at der skal tages conj(a[k][j]*a[i][k])*/
+                                }
+                        }
+
+                        for (j = 1; j <= l; j++){
+                                p[j] /= h;                            /* Rescale properly */
+
+                        }
+                        for (j = 1; j <= l; j++) {                   /* Second part of A u -> p */
+                                g = 0;                                /* Form an element of A*u in g */
+                                for (k = 1; k <= j; k++){
+                                        g += a[j][k] * (conj(a[i][k]));     /* g += a[j][k]*a[i][k]^* */
+                                }
+                                p[j] += (g / h); /* Store the result in p[j] */
+                        }
+                        f = zero;
+                        for (j = 1; j <= l; j++){
+                                f += a[i][j] * p[j];                  /* accumulate u * p in f */
+                        }
+                        //if ((imag(f) / abs(f)) > 1e-10)
+                        if (imag(f) >SMALL_NUMBER)
+                        {
+                                printf("\n\n Error to big, a(i,j)*p(j)=\n");
+                                for (j = 1; j <= l; j++){
+                                        printf("\n a[ %d",i);
+                                        printf("][ %d", j);
+                                        printf("]*p[ %d", j);
+                                        printf("]=( %g", real(a[i][j]));
+                                        printf("+ i* %g", imag(a[i][j]));
+                                        printf(")*( %g", real(p[j]));
+                                        printf("+ i* %g", imag(p[j]));
+                                        printf(") = %g", real(a[i][j] * p[j]));
+                                        printf("+ i* %g", imag(a[i][j] * p[j]));
+                                }
+                                printf("\n\n imag(f)= %g", imag(f));
+                                printf("\n\n abs(f)= %g",abs(f));
+                                printf("\n\n");
+                        fatalerror("Householder: K is not real, as expected");
+                        }
+                        hh = real(f) / (h + h);               /* form K */
+                        for (j = 1; j <= l; j++) {                    /* Form q and overwrite p with it */
+                                f = conj(a[i][j]);                    /* store entry a[i][j]^* = u[j] in f */
+                                g = p[j] = p[j] - hh*f;                 /* p[j] = p[j] - hh*f */
+                                for (k = 1; k <= j; k++)                      /* Reduce a - we can stop at j */
+                                        a[j][k] -= (f*(conj(p[k])) + g*a[i][k]);    /* a[j][k] -= (f * p[k]^* + g * a[i][k]) */
+                        }
+                }
+        }
+        else{
+                     e[l] = conj(a[i][l]);                     /* copy complex conjugate of matrix element above diagonal */
+        }
+        p[i] = h;                                     /* Now store h in p[i] - to be able to check later if it was zero */
+
+        #ifdef TEST_DIAGONALIZE
+            printf("htred2 loop; i = %d ; a = \n",i);
+              for(ii=1;ii<=num;ii++) {
+                for(jj=1;jj<=num;jj++) 
+                {
+                    printf(" ( %g ",real(a[ii][jj]));
+                    printf(" + i %g ",imag(a[ii][jj]));
+                    printf(" ) ");
+                }
+                printf("\n");
+            }
+            printf("\n");
+        #endif
+}
+
+p[1] = zero;                                     /* In the last transformation step, there is nothing to do */
+
+#ifdef FIND_EIGENSTATE
+for (i = 1; i <= dim; i++) {
+        l = i - 1;
+        if (real(p[i])) {                             /* skip block if we did not do a transformation */
+                for (j = 1; j <= l; j++)
+                        p[j] = 0;
+                for (k = 1; k <= l; k++) {
+                        for (j = 0; j <= l; j++)                      /* Use u^t und u^t/H stored in m to form PQ */
+                                p[k] += a[i][k] * a[k][j];      /* g += a[i][k]*a[k][j] */
+                }
+                for (k = 1; k <= l; k++) {                    /* Now we need a second loop */
+                        for (j = 1; j <= l; j++)
+                                a[k][j] -= p[k] * (conj(a[k][i]));    /* a[k][j] -= g * a[k][i]^* */
+                }
+        }
+        d[i] = a[i][i];                       /* this statement must be kept in any case */
+        a[i][i] = one;                                /* Reset row and column of a to identity matrix for next iteration */
+        for (j = 1; j <= l; j++)
+                a[i][j] = a[j][i] = zero;
+}
+#endif /*FIND_EIGENSTATE*/
+#ifndef FIND_EIGENSTATE
+        for (i = 1; i <= dim; i++)
+                d[i] = a[i][i];                            /* this statement must be kept in any case */
+#endif /*not defined FIND_EIGENSTATE*/
+
+}
+
+long long htqli(double *d,double *e,long long num,komplex **z)
+{    /* CRECIPES -- HEDEGARD */
+  long long m,l,iter,i,k;
+  double s,r,p,g,f,dd,c,b;
+  komplex fc;
+  long long itercollect=0;
+  char errortext[100];
+  iter=0;
+
+  for (i=2;i<=num;i++) e[i-1]=e[i];
+  e[num]=0.0;
+  for (l=1;l<=num;l++) {
+    itercollect+=iter;
+    iter=0;
+    do {
+      for (m=l;m<=num-1;m++) {
+	dd=fabs(d[m])+fabs(d[m+1]);
+	if (fabs(e[m])+dd == dd) break;
+      }
+      if (m != l) {
+	if (iter++ == 500){
+          fatalerror("Too many interations in TQLI");
+	} 
+	g=(d[l+1]-d[l])/(2.0*e[l]);
+	r=sqrt((g*g)+1.0);
+	g=d[m]-d[l]+e[l]/(g+SIGN_CONTROLLED(r,g));
+	s=c=1.0;
+	p=0.0;
+	for (i=m-1;i>=l;i--) {
+	  f=s*e[i];
+	  b=c*e[i];
+	  if (fabs(f) >= fabs(g)) {
+	    c=g/f;
+	    r=sqrt((c*c)+1.0);
+	    e[i+1]=f*r;
+	    c *= (s=1.0/r);
+	  } else {
+	    s=f/g;
+	    r=sqrt((s*s)+1.0);
+	    e[i+1]=g*r;
+	    s *= (c=1.0/r);
+	  }
+	  g=d[i+1]-p;
+	  r=(d[i]-g)*s+2.0*c*b;
+	  p=s*r;
+	  d[i+1]=g+p;
+	  g=c*r-b;
+	  /* Next loop could be omitted if eigenvectors not wanted,
+	     ecxept we need it for the lanczos stopping criteria */
+	  for (k=1;k<=num;k++) {
+	    fc=z[k][i+1];
+	    z[k][i+1]=s*z[k][i]+c*fc;
+	    z[k][i]=c*z[k][i]-s*fc;
+	  }
+	}
+	d[l]=d[l]-p;
+	e[l]=g;
+	e[m]=0.0;
+      }
+
+    } while (m != l);
+  }
+  return itercollect;
+}
+
+void eigsrt(double *d,komplex **v,long long num)
+{    /* CRECIPES -- HEDEGARD */
+  long long k,j,i;
+  double p;
+  komplex  pc;
+  
+  for (i=1;i<num;i++) {
+    p=d[k=i];
+    for (j=i+1;j<=num;j++)
+      if (d[j] <= p) p=d[k=j];
+    if (k != i) {
+      d[k]=d[i];
+      d[i]=p;
+      for (j=1;j<=num;j++) {
+	pc=v[j][i];
+	v[j][i]=v[j][k];
+	v[j][k]=pc;
+      }
+    }
+  }
+}
+
+/* Example of call:
+void Eigenvectors(double qx,double qy,komplex **cpoint){
+int i,j;
+komplex cp;
+htred2(Hk,nn,dd,ee);
+
+for(i=1;i<=nn;i++){
+  ff[i] = real(dd[i]);
+  gg[i] = real(ee[i]);
+};
+
+htqli(ff,gg,nn,Hk);
+eigsrt(ff,Hk,nn);
+
+
+}
+*/
+//----------------- END OF DIAGONALIZATION CODE ---------------------
+
+
+
+double zridd(double (*func)(komplex*), double x1, double x2, komplex *parms, double xacc)
+    {
+      int j;
+      double ans, fh, fl, fm, fnew, s, xh, xl, xm, xnew;
+
+      parms[0]=x1;
+      fl=(*func)(parms);
+      parms[0]=x2;
+      fh=(*func)(parms);
+      if (fl*fh >= 0)
+      {
+        if (fl==0) return x1;
+        if (fh==0) return x2;
+        return UNUSED;
+      }
+      else
+      {
+        xl=x1;
+        xh=x2;
+//        printf("zridd sign change: v_low : %g v_high: %g \n",xl,xh);
+        ans=UNUSED;
+        for (j=1; j<MAXRIDD; j++)
+        {
+          xm=0.5*(xl+xh);
+          parms[0]=xm;
+          fm=(*func)(parms);
+          s=sqrt(fm*fm-fl*fh);
+          if (s == 0.0)
+            return ans;
+          xnew=xm+(xm-xl)*((fl >= fh ? 1.0 : -1.0)*fm/s);
+          if (fabs(xnew-ans) <= xacc)
+            return ans;
+          ans=xnew;
+          parms[0]=ans;
+          fnew=(*func)(parms);
+          if (fnew == 0.0) return ans;
+          if (fabs(fm)*SIGN(fnew) != fm)
+          {
+            xl=xm;
+            fl=fm;
+            xh=ans;
+            fh=fnew;
+          }
+          else
+            if (fabs(fl)*SIGN(fnew) != fl)
+            {
+              xh=ans;
+              fh=fnew;
+            }
+            else
+              if(fabs(fh)*SIGN(fnew) != fh)
+              {
+                xl=ans;
+                fl=fnew;
+              }
+              else
+                fatalerror("never get here in zridd");
+          if (fabs(xh-xl) <= xacc)
+            return ans;
+        }
+        fatalerror("zridd exceeded maximum iterations");
+      }
+      return 0.0;  /* Never get here */
+    }
+
+#pragma acc routine 
+double zridd_gpu(double x1, double x2, komplex *parms, double xacc)
+    {
+      int j;
+      double ans, fh, fl, fm, fnew, s, xh, xl, xm, xnew;
+
+      parms[0]=x1;
+      fl=omega_q(parms);
+      parms[0]=x2;
+      fh=omega_q(parms);
+      if (fl*fh >= 0)
+      {
+        if (fl==0) return x1;
+        if (fh==0) return x2;
+        return UNUSED;
+      }
+      else
+      {
+        xl=x1;
+        xh=x2;
+        ans=UNUSED;
+        for (j=1; j<MAXRIDD; j++)
+        {
+          xm=0.5*(xl+xh);
+          parms[0]=xm;
+          fm=omega_q(parms);
+          s=sqrt(fm*fm-fl*fh);
+          if (s == 0.0)
+            return ans;
+          xnew=xm+(xm-xl)*((fl >= fh ? 1.0 : -1.0)*fm/s);
+          if (fabs(xnew-ans) <= xacc)
+            return ans;
+          ans=xnew;
+          parms[0]=ans;
+          fnew=omega_q(parms);
+          if (fnew == 0.0) return ans;
+          if (fabs(fm)*SIGN(fnew) != fm)
+          {
+            xl=xm;
+            fl=fm;
+            xh=ans;
+            fh=fnew;
+          }
+          else
+            if (fabs(fl)*SIGN(fnew) != fl)
+            {
+              xh=ans;
+              fh=fnew;
+            }
+            else
+              if(fabs(fh)*SIGN(fnew) != fh)
+              {
+                xl=ans;
+                fl=fnew;
+              }
+              else
+                fatalerror("never get here in zridd");
+          if (fabs(xh-xl) <= xacc)
+            return ans;
+        }
+        fatalerror("zridd exceeded maximum iterations");
+      }
+      return 0.0;  /* Never get here */
+    }
+
+ 
+#define ROOTACC 1e-8
+
+  int findroots(double brack_low, double brack_mid, double brack_high, double *list, int* index, double (*f)(komplex*), komplex *parms)
+    {
+      double root,range;
+      
+      int i, steps=STEPS;
+
+      range = brack_mid-brack_low;
+     for (i=0; i<steps; i++)  // First, find roots in energy loss side, if any
+     {
+      root = zridd(f, brack_low+range*i/(int)steps,
+                   brack_low+range*(i+1)/(int)steps,
+                   (komplex *)parms, ROOTACC);
+      if (root != UNUSED)
+      {
+        list[(*index)++]=root;
+//        printf("findroots returned: %g \n",root);
+      }
+     }
+      range = brack_high-brack_mid;
+     
+     for (i=0; i<steps; i++)  // Second, find roots in energy gain side, there is always some
+     {
+      root = zridd(f, brack_mid+range*i/(int)steps, 
+                   brack_mid+range*(i+1)/(int)steps, 
+                   (komplex *)parms, ROOTACC);
+      if (root != UNUSED)
+      {
+        list[(*index)++]=root;
+//        printf("findroots returned: %g \n",root);
+      }
+     }
+    }
+  
+#pragma acc routine 
+  int findroots_gpu(double brack_low, double brack_mid, double brack_high, double *list, int* index, double *parms)
+    {
+      double root,range=brack_mid-brack_low;
+      int i, steps=STEPS;
+
+     for (i=0; i<steps; i++)
+     {
+       root = zridd_gpu(brack_low+range*i/(int)steps,
+                   brack_low+range*(i+1)/(int)steps,
+                   (komplex *)parms, ROOTACC);
+      if (root != UNUSED)
+      {
+        list[(*index)++]=root;
+      }
+     }  // MAKE LOOP HERE ALSO
+      root = zridd_gpu(brack_mid, brack_high, (komplex *)parms, ROOTACC);
+      if (root != UNUSED)
+      {
+        list[(*index)++]=root;
+      }
+    }
+  
+#undef UNUSED
+#undef MAXRIDD
+#endif
+%}
+
+DECLARE
+%{
+  double V_rho;
+  double V_my_s;
+  double V_my_a_v;
+  double DV;
+  komplex **Matrix;
+  int i,j;
+  komplex p_call[22];
+%}
+INITIALIZE
+%{
+  V_rho = 4/(a*a*a);
+  V_my_s = (V_rho * 100 * sigma_inc);
+  V_my_a_v = (V_rho * 100 * sigma_abs * 2200);
+  DV = 0.001;   /* Velocity change used for numerical derivative */
+
+  /* now compute target coords if a component index is supplied */
+  if (!target_index && !target_x && !target_y && !target_z) target_index=1;
+  if (target_index){
+    Coords ToTarget;
+    ToTarget = coords_sub(POS_A_COMP_INDEX(INDEX_CURRENT_COMP+target_index), POS_A_CURRENT_COMP);
+    ToTarget = rot_apply(ROT_A_CURRENT_COMP, ToTarget);
+    coords_get(ToTarget, &target_x, &target_y, &target_z);
+  }
+  if (!(target_x || target_y || target_z)) {
+    printf("Phonon_simple: %s: The target is not defined. Using direct beam (Z-axis).\n",
+      NAME_CURRENT_COMP);
+    target_z=1;
+  }
+  
+  // ----------------CALL OF DIAGONALIZATION ------------------------------
+#ifdef TEST_DIAGONALIZE_LV2
+  double eig[12];
+  long long dim = 3;
+  Matrix = kmatrix(1,dim,1,dim);
+  Matrix[1][1] = (komplex)-1;
+  Matrix[1][2] = (komplex)I;
+  Matrix[1][3] = 1;
+  Matrix[2][1] = (komplex)-I;
+  Matrix[2][2] = (komplex)-3;
+  Matrix[2][3] = (komplex)1 - I;
+  Matrix[3][1] = 1;
+  Matrix[3][2] = (komplex)1 + I;
+  Matrix[3][3] = 0;
+  Diagonalize(Matrix, dim, eig);
+  printf("Diagonalization done, eigenvalues are a: %g ; b: %g ; c: %g \n",eig[0],eig[1],eig[2]);
+  printf("Eigenvectors:");
+  for (i=1; i<4; i++) {
+      printf("\n(");
+      for (j=1; j<4; j++)
+          printf(" ( %g + i %g ) ",real(Matrix[i][j]),imag(Matrix[i][j]));
+      printf(")\n");
+  }
+  freecmatrix(Matrix,1,dim,1,dim);
+
+  // ----------------END CALL OF DIAGONAIZATION---------------------
+  
+  // -----------------CALL OF omega_q ------------------------------
+        p_call[0] = (komplex)0; // vf
+        p_call[1] = (komplex)100.00; //vi
+        p_call[2] = (komplex)0; // vf_x
+        p_call[3] = (komplex)0; // vf_y
+        p_call[4] = (komplex)0; // vf_z
+        p_call[5] = (komplex)0; // vi_x
+        p_call[6] = (komplex)0;  // vi_y
+        p_call[7] = (komplex)100; // vi_z   This correponds to a q of approx (0 0 0.15)
+
+        double res_Eph, px, py, pz, diff;
+        int i,j;
+        for (i=0; i<12; i++)
+        {
+          mode = i;
+          diff = real(omega_q(p_call));
+          res_Eph = real(p_call[20]);
+        
+          printf("\n mode = %d, Ephonon = %g, Ediff = %g \n",mode,res_Eph,diff);
+          printf("p-vector = (");
+          for (j=8; j<20; j++) 
+              printf("( %g + i %g ) ",real(p_call[j]),imag(p_call[j]));
+          printf(" )\n");
+        }
+#endif
+  // -----------------END CALL OF omega_q --------------------------
+  
+%}
+TRACE
+%{
+  double t0, t1;                /* Entry/exit time for cylinder */
+  double v_i, v_f;               /* Neutron velocities: initial, final */
+  double vx_i, vy_i, vz_i;  /* Neutron initial velocity vector */
+  double dt0, dt;             /* Flight times through sample */
+  double l_full;                /* Flight path length for non-scattered neutron */
+  double l_i, l_o;              /* Flight path lenght in/out for scattered neutron */
+  double my_a_i;                  /* Initial attenuation factor */
+  double my_a_f;                  /* Final attenuation factor */
+  double solid_angle;           /* Solid angle of target as seen from scattering point */
+  double aim_x=0, aim_y=0, aim_z=1;   /* Position of target relative to scattering point */
+  double kappa_x, kappa_y, kappa_z;   /* Scattering vector */
+  double kappa2;             /* Square of the scattering vector */
+  double bose_factor;        /* Calculated value of the Bose factor */
+  double omega;              /* energy transfer */
+  int nf, index;                   /* Number of allowed final velocities */
+  double vf_list[20];             /* List of allowed final velocities */
+  double J_factor;            /* Jacobian from delta fnc.s in cross section */
+  double f1, f2;            /* probed values of omega_q minus omega */
+  double p1,p2,p3,p4,p5;    /* temporary multipliers */
+  double parms[11];
+  
+  if(cylinder_intersect(&t0, &t1, x, y, z, vx, vy, vz, radius, yheight))
+  {
+    if(t0 < 0)
+      ABSORB; /* Neutron came from the sample or begins inside */
+
+    /* Neutron enters at t=t0. */
+    dt0 = t1-t0;                /* Time in sample */
+    v_i = sqrt(vx*vx + vy*vy + vz*vz);
+    l_full = v_i * dt0;   /* Length of path through sample if not scattered */
+    dt = rand01()*dt0;    /* Time of scattering (relative to t0) */
+    l_i = v_i*dt;                 /* Penetration in sample at scattering */
+    vx_i=vx;
+    vy_i=vy;
+    vz_i=vz;
+    PROP_DT(dt+t0);             /* Point of scattering */
+
+    aim_x = target_x-x;         /* Vector pointing at target (e.g. analyzer) */
+    aim_y = target_y-y;
+    aim_z = target_z-z;
+
+    if(focus_aw && focus_ah) {
+      randvec_target_rect_angular(&vx, &vy, &vz, &solid_angle,
+        aim_x, aim_y, aim_z, focus_aw, focus_ah, ROT_A_CURRENT_COMP);
+    } else if(focus_xw && focus_yh) {
+      randvec_target_rect(&vx, &vy, &vz, &solid_angle,
+        aim_x, aim_y, aim_z, focus_xw, focus_yh, ROT_A_CURRENT_COMP);
+    } else {
+      randvec_target_sphere(&vx,&vy,&vz,&solid_angle,aim_x,aim_y,aim_z, focus_r);
+    }
+    NORM(vx, vy, vz);
+    nf=0;
+      p_call[0]=-1;
+      p_call[1]=v_i;
+      p_call[2]=vx;
+      p_call[3]=vy;
+      p_call[4]=vz;
+      p_call[5]=vx_i;
+      p_call[6]=vy_i;
+      p_call[7]=vz_i;
+
+      
+      mode = mode_input;  // Here should be a random choce of modes, if mode = -1
+      
+      #ifndef OPENACC
+    findroots(0, v_i, v_i+V_HIGH, vf_list, &nf, omega_q, p_call);
+//    printf("findroots returned %d roots \n",nf);
+    #else
+    findroots_gpu(0, v_i, v_i+V_HIGH, vf_list, &nf, p_call);
+    #endif
+    
+    // ________________ ALL FROM HERE SHOULD BE REVISITED ___________________
+   
+    index=(int)floor(rand01()*nf);
+ //   if (index<2) {
+      v_f=vf_list[index];
+      p_call[0]=v_f-DV;
+      f1=omega_q(p_call);
+      p_call[0]=v_f+DV;
+      f2=omega_q(p_call);
+      J_factor = fabs(f2-f1)/(2*DV*K2V);
+      omega=VS2E*(v_i*v_i-v_f*v_f);
+      vx *= v_f;
+      vy *= v_f;
+      vz *= v_f;
+      kappa_x=V2K*(vx_i-vx);
+      kappa_y=V2K*(vy_i-vy);
+      kappa_z=V2K*(vz_i-vz);
+
+      kappa2=kappa_z*kappa_z+kappa_y*kappa_y+kappa_x*kappa_x;
+      //printf("omega=%f, k_x=%f, k_y=%f, k_z=%f\n", omega, kappa_x, kappa_y, kappa_z);
+      double astar = 4*PI/(sqrt(3)*a);  // length of reciprocal lattice vector a*
+      double cstar = 2*PI/c;  // length of reciprocal lattice vector c*
+      //printf("h=%f, l=%f\n", kappa_x/astar, kappa_z/cstar);
+      
+      if(!cylinder_intersect(&t0, &t1, x, y, z, vx, vy, vz, radius, yheight))
+	{
+	  /* ??? did not hit cylinder */
+	  printf("FATAL ERROR: Did not hit cylinder from inside.\n");
+	  exit(1);
+	}
+      dt = t1;
+      l_o = v_f*dt;
+      
+      my_a_i = V_my_a_v/v_i;
+      my_a_f = V_my_a_v/v_f;
+      bose_factor=nbose(omega,T);
+      p1 = exp(-(V_my_s*(l_i+l_o)+my_a_i*l_i+my_a_f*l_o)); /* Absorption factor */
+      p2 = nf*solid_angle*l_full*V_rho/(4*PI);     /* Focusing factors; assume random choice of n_f possibilities */
+      p3 = (v_f/v_i)*DW*(kappa2*K2V*K2V*VS2E)/fabs(omega)*bose_factor;   /* Cross section factor 1 */
+      p4 = 2*VS2E*v_f/J_factor;  /* Jacobian of delta functions in cross section */
+      p5 = b*b/M;  /* Cross section factor 2. !! WORKS ONLY FOR 1-ATOM UNIT CELLS !! */
+      p *= p1*p2*p3*p4*p5*12;  //The factor 12 is due to the 12 modes
+//    } else {
+//      ABSORB; // findroots returned junk
+//    }
+  } /* else transmit: Neutron did not hit the sample */
+%}
+
+MCDISPLAY
+%{
+  
+  circle("xz", 0,  yheight/2.0, 0, radius);
+  circle("xz", 0, -yheight/2.0, 0, radius);
+  line(-radius, -yheight/2.0, 0, -radius, +yheight/2.0, 0);
+  line(+radius, -yheight/2.0, 0, +radius, +yheight/2.0, 0);
+  line(0, -yheight/2.0, -radius, 0, +yheight/2.0, -radius);
+  line(0, -yheight/2.0, +radius, 0, +yheight/2.0, +radius);
+%}
+
+END
